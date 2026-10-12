@@ -1,0 +1,262 @@
+// AutoVerse Global — Production PostgreSQL Database Schema (Prisma ORM)
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum PowertrainType {
+  BATTERY_ELECTRIC
+  HYBRID
+  PLUG_IN_HYBRID
+  PETROL
+  DIESEL
+  HYDROGEN_FUEL_CELL
+}
+
+enum BodyStyle {
+  SUV
+  SEDAN
+  HATCHBACK
+  COUPE
+  SPORTS_CAR
+  CONVERTIBLE
+  MPV
+  PICKUP
+}
+
+enum AvailabilityStatus {
+  AVAILABLE_NOW
+  UPCOMING
+  DISCONTINUED
+  HISTORICAL
+}
+
+enum VerificationLevel {
+  OFFICIAL_OEM
+  HOMOLOGATION_REGISTRY
+  INDEPENDENT_TEST
+}
+
+model User {
+  id            String          @id @default(uuid())
+  phoneNumber   String          @unique
+  countryCode   String
+  name          String
+  email         String?         @unique
+  role          Role            @default(USER)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  lastLoginAt   DateTime        @default(now())
+  favorites     Favorite[]
+  searchHistory SearchHistory[]
+  reviews       Review[]
+}
+
+model Brand {
+  id              String         @id @default(uuid())
+  name            String         @unique
+  slug            String         @unique
+  country         String
+  foundedYear     Int
+  headquarters    String
+  website         String
+  description     String
+  activeStatus    String         @default("Active")
+  modelsCount     Int            @default(0)
+  verified        Boolean        @default(true)
+  primarySegments String[]
+  dataSources     String[]
+  lastVerifiedAt  DateTime       @default(now())
+  vehicles        VehicleModel[]
+
+  @@index([country])
+}
+
+model VehicleModel {
+  id                 String             @id @default(uuid())
+  brandId            String
+  brand              Brand              @relation(fields: [brandId], references: [id], onDelete: Cascade)
+  name               String
+  slug               String             @unique
+  modelYear          Int
+  generation         String
+  bodyStyle          BodyStyle
+  primaryMarket      String
+  availabilityStatus AvailabilityStatus @default(AVAILABLE_NOW)
+  launchDate         DateTime
+  powertrainType     PowertrainType
+  basePriceCurrency  String             @default("USD")
+  basePriceAmount    Float
+  expertVerdict      String
+  isTrending         Boolean            @default(false)
+  isLatestLaunch     Boolean            @default(false)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  variants           Variant[]
+  specifications     Specification?
+  dimensions         Dimension?
+  safetyRating       SafetyRating?
+  pricing            MarketPrice[]
+  images             VehicleImage[]
+  reviews            Review[]
+  favorites          Favorite[]
+
+  @@index([bodyStyle])
+  @@index([powertrainType])
+  @@index([modelYear])
+  @@index([basePriceAmount])
+}
+
+model Variant {
+  id                  String       @id @default(uuid())
+  vehicleId           String
+  vehicle             VehicleModel @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  name                String
+  trimLevel           String
+  priceCurrency       String       @default("USD")
+  priceAmount         Float
+  powerHp             Int
+  torqueNm            Int
+  zeroToHundredKphSec Float
+  topSpeedKph         Int
+  rangeKm             Int?
+  batteryKwh          Float?
+  transmission        String
+  driveType           String
+  keyFeatures         String[]
+}
+
+model Specification {
+  id                    String       @id @default(uuid())
+  vehicleId             String       @unique
+  vehicle               VehicleModel @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  maxPowerHp            Int
+  maxPowerKw            Int
+  maxTorqueNm           Int
+  transmission          String
+  gearCount             Int?
+  driveType             String
+  zeroToHundredKphSec   Float
+  topSpeedKph           Int
+  batteryCapacityKwh    Float?
+  usableBatteryKwh      Float?
+  electricRangeKm       Int?
+  chargingSpeedKw       Int?
+  chargingTime10to80Min Int?
+  fuelEfficiencyKmpl    Float?
+  fuelTankCapacityL     Float?
+  emissionStandard      String
+}
+
+model Dimension {
+  id                  String       @id @default(uuid())
+  vehicleId           String       @unique
+  vehicle             VehicleModel @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  lengthMm            Int
+  widthMm             Int
+  heightMm            Int
+  wheelbaseMm         Int
+  groundClearanceMm   Int
+  bootCapacityLiters  Int
+  frunkCapacityLiters Int?
+  seatingCapacity     Int
+  doors               Int
+  kerbWeightKg        Int
+  wheelSizeInches     Int
+  tyreSpecs           String
+}
+
+model SafetyRating {
+  id                         String       @id @default(uuid())
+  vehicleId                  String       @unique
+  vehicle                    VehicleModel @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  ncapOrganization           String
+  stars                      Int
+  yearTested                 Int
+  adultSafetyPercent         Int
+  childSafetyPercent         Int
+  vulnerableRoadUserPercent  Int
+  safetyAssistPercent        Int
+  testNotes                  String
+}
+
+model MarketPrice {
+  id           String       @id @default(uuid())
+  vehicleId    String
+  vehicle      VehicleModel @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  marketCode   String
+  marketName   String
+  currency     String
+  price        Float
+  localTaxNote String
+  updatedAt    DateTime     @default(now())
+
+  @@index([marketCode])
+}
+
+model VehicleImage {
+  id             String       @id @default(uuid())
+  vehicleId      String
+  vehicle        VehicleModel @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  category       String
+  url            String
+  caption        String
+  isPrimary      Boolean      @default(false)
+  verifiedSource String
+}
+
+model Review {
+  id              String       @id @default(uuid())
+  vehicleId       String
+  vehicle         VehicleModel @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  userId          String?
+  user            User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  authorName      String
+  rating          Int
+  title           String
+  reviewText      String
+  verifiedOwner   Boolean      @default(true)
+  ownershipPeriod String
+  createdAt       DateTime     @default(now())
+}
+
+model Favorite {
+  id        String       @id @default(uuid())
+  userId    String
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicleId String
+  vehicle   VehicleModel @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  createdAt DateTime     @default(now())
+
+  @@unique([userId, vehicleId])
+}
+
+model SearchHistory {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  query     String
+  filters   Json?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  adminUser    String
+  action       String
+  targetEntity String
+  details      String
+  timestamp    DateTime @default(now())
+}

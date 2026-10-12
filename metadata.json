@@ -1,0 +1,6 @@
+{
+  "name": "AutoVerse Global",
+  "description": "Every Car. Every Detail. One World. Global automotive platform featuring comprehensive vehicle specifications, multi-model comparisons, verified international pricing, authentic imagery, and phone-authenticated collections.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
