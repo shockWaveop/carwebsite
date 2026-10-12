@@ -1,5 +1,17 @@
-import fs from 'fs';
-import path from 'path';
+import { and, asc, desc, eq, inArray, isNull, lt, or, sql } from 'drizzle-orm';
+import { db as orm } from '../../db/index.js';
+import {
+  appMeta,
+  auditLogs,
+  brands,
+  favorites,
+  pendingOtps,
+  reviews,
+  searchHistory,
+  sessions,
+  users,
+  vehicles
+} from '../../db/schema.js';
 import {
   Brand,
   Vehicle,
@@ -18,281 +30,290 @@ import {
   initialReviews
 } from './initialData.js';
 
-interface DatabaseState {
-  brands: Brand[];
-  vehicles: Vehicle[];
-  articles: Article[];
-  dataSources: DataSourceRecord[];
-  reviews: Review[];
-  users: User[];
-  userFavorites: { [userId: string]: string[] }; // userId -> array of vehicleIds
-  searchHistory: SearchHistoryEntry[];
-  auditLogs: AuditLogEntry[];
-  pendingOtps: {
-    [phoneNumber: string]: {
-      code: string;
-      expiresAt: number;
-      createdAt: number;
-      attempts: number;
-    };
-  };
-  activeSessions: {
-    [token: string]: {
-      userId: string;
-      createdAt: number;
-      expiresAt: number;
-    };
+const SEED_KEY = 'seed_v1';
+
+type UserRow = typeof users.$inferSelect;
+
+function toUser(row: UserRow): User {
+  return {
+    id: row.id,
+    phoneNumber: row.phoneNumber,
+    countryCode: row.countryCode,
+    name: row.name,
+    email: row.email ?? undefined,
+    role: row.role as User['role'],
+    createdAt: row.createdAt.toISOString(),
+    lastLoginAt: row.lastLoginAt.toISOString()
   };
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const DB_FILE = path.join(DATA_DIR, 'autoverse_db.json');
+function toHistory(row: typeof searchHistory.$inferSelect): SearchHistoryEntry {
+  return {
+    id: row.id,
+    userId: row.userId ?? undefined,
+    query: row.query,
+    filters: (row.filters as SearchHistoryEntry['filters']) ?? undefined,
+    timestamp: row.createdAt.toISOString()
+  };
+}
+
+function toAudit(row: typeof auditLogs.$inferSelect): AuditLogEntry {
+  return {
+    id: row.id,
+    timestamp: row.createdAt.toISOString(),
+    adminUser: row.adminUser,
+    action: row.action as AuditLogEntry['action'],
+    targetEntity: row.targetEntity,
+    details: row.details
+  };
+}
+
+function randomId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+}
+
+// Seed rows get increasing timestamps so the catalog keeps its curated order.
+function seedTimes(count: number, base = new Date('2025-01-01T00:00:00Z').getTime()) {
+  return Array.from({ length: count }, (_, i) => new Date(base + i * 1000));
+}
 
 class DatabaseService {
-  private state: DatabaseState;
+  private seeded: Promise<void> | null = null;
 
-  constructor() {
-    this.state = this.loadInitialState();
+  // Loads the bundled catalog and demo accounts into an empty database exactly once.
+  public ensureSeeded(): Promise<void> {
+    if (!this.seeded) {
+      this.seeded = this.seed().catch((err) => {
+        this.seeded = null;
+        throw err;
+      });
+    }
+    return this.seeded;
   }
 
-  private loadInitialState(): DatabaseState {
-    try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
+  private async seed() {
+    const [marker] = await orm.select().from(appMeta).where(eq(appMeta.key, SEED_KEY));
+    if (marker) return;
 
-      if (fs.existsSync(DB_FILE)) {
-        const existingVehicleIds = new Set((parsed.vehicles || []).map((v: any) => v.id));
-        const mergedVehicles = [
-          ...(parsed.vehicles || []),
-          ...initialVehicles.filter((v) => !existingVehicleIds.has(v.id))
-        ];
+    const brandTimes = seedTimes(initialBrands.length);
+    await orm
+      .insert(brands)
+      .values(initialBrands.map((b, i) => ({ id: b.id, slug: b.slug, data: b, createdAt: brandTimes[i] })))
+      .onConflictDoNothing();
 
-        const existingBrandIds = new Set((parsed.brands || []).map((b: any) => b.id));
-        const mergedBrands = [
-          ...(parsed.brands || []),
-          ...initialBrands.filter((b) => !existingBrandIds.has(b.id))
-        ];
+    const vehicleTimes = seedTimes(initialVehicles.length);
+    await orm
+      .insert(vehicles)
+      .values(initialVehicles.map((v, i) => ({ id: v.id, slug: v.slug, data: v, createdAt: vehicleTimes[i] })))
+      .onConflictDoNothing();
 
-        return {
-          brands: mergedBrands,
-          vehicles: mergedVehicles,
-          articles: parsed.articles || initialArticles,
-          dataSources: parsed.dataSources || initialDataSources,
-          reviews: parsed.reviews || initialReviews,
-          users: parsed.users || this.getDefaultUsers(),
-          userFavorites: parsed.userFavorites || {},
-          searchHistory: parsed.searchHistory || [],
-          auditLogs: parsed.auditLogs || this.getDefaultAuditLogs(),
-          pendingOtps: parsed.pendingOtps || {},
-          activeSessions: parsed.activeSessions || {}
-        };
-      }
-    } catch (err) {
-      console.warn('Could not read existing database file, falling back to defaults:', err);
+    if (initialReviews.length) {
+      // Reviews are listed newest first, so the first seed review gets the latest timestamp.
+      const reviewTimes = seedTimes(initialReviews.length).reverse();
+      await orm
+        .insert(reviews)
+        .values(initialReviews.map((r, i) => ({ id: r.id, vehicleId: r.vehicleId, data: r, createdAt: reviewTimes[i] })))
+        .onConflictDoNothing();
     }
 
-    const defaultState: DatabaseState = {
-      brands: initialBrands,
-      vehicles: initialVehicles,
-      articles: initialArticles,
-      dataSources: initialDataSources,
-      reviews: initialReviews,
-      users: this.getDefaultUsers(),
-      userFavorites: {
-        'usr-demo-1': ['car-porsche-taycan-turbo-s', 'car-ferrari-296-gtb']
-      },
-      searchHistory: [
+    await orm
+      .insert(users)
+      .values([
         {
-          id: 'sh-1',
-          userId: 'usr-demo-1',
-          query: 'Porsche Taycan',
-          timestamp: new Date(Date.now() - 3600000 * 2).toISOString()
+          id: 'usr-admin-1',
+          phoneNumber: '+1 555-0199',
+          countryCode: '+1',
+          name: 'Chief Automotive Editor (Admin)',
+          email: 'admin@autoverse.global',
+          role: 'ADMIN',
+          createdAt: new Date('2025-01-01T00:00:00Z')
         },
+        {
+          id: 'usr-demo-1',
+          phoneNumber: '+1 555-0100',
+          countryCode: '+1',
+          name: 'Alex Vance',
+          email: 'alex.vance@autoverse.example',
+          role: 'USER',
+          createdAt: new Date('2025-02-10T12:00:00Z')
+        }
+      ])
+      .onConflictDoNothing();
+
+    await orm
+      .insert(favorites)
+      .values([
+        { userId: 'usr-demo-1', vehicleId: 'car-porsche-taycan-turbo-s' },
+        { userId: 'usr-demo-1', vehicleId: 'car-ferrari-296-gtb' }
+      ])
+      .onConflictDoNothing();
+
+    await orm
+      .insert(searchHistory)
+      .values([
+        { id: 'sh-1', userId: 'usr-demo-1', query: 'Porsche Taycan', createdAt: new Date(Date.now() - 3600000 * 2) },
         {
           id: 'sh-2',
           userId: 'usr-demo-1',
           query: 'Electric SUV under $100k',
           filters: { powertrain: 'Battery Electric', bodyStyle: 'SUV' },
-          timestamp: new Date(Date.now() - 3600000 * 24).toISOString()
+          createdAt: new Date(Date.now() - 3600000 * 24)
         }
-      ],
-      auditLogs: this.getDefaultAuditLogs(),
-      pendingOtps: {},
-      activeSessions: {}
-    };
+      ])
+      .onConflictDoNothing();
 
-    this.saveState(defaultState);
-    return defaultState;
-  }
+    await orm
+      .insert(auditLogs)
+      .values([
+        {
+          id: 'log-1',
+          createdAt: new Date(Date.now() - 86400000 * 3),
+          adminUser: 'Chief Automotive Editor',
+          action: 'VERIFY_RECORD',
+          targetEntity: 'Porsche Taycan Turbo S',
+          details: 'Verified against European Community Whole Vehicle Type-Approval (EC-WVTA) certificates.'
+        },
+        {
+          id: 'log-2',
+          createdAt: new Date(Date.now() - 86400000 * 2),
+          adminUser: 'Chief Automotive Editor',
+          action: 'UPDATE_PRICING',
+          targetEntity: 'BMW iX M60 xDrive',
+          details: 'Updated Euro and GCC pricing based on official 2026 manufacturer dealer bulletin.'
+        }
+      ])
+      .onConflictDoNothing();
 
-  private getDefaultUsers(): User[] {
-    return [
-      {
-        id: 'usr-admin-1',
-        phoneNumber: '+1 555-0199',
-        countryCode: '+1',
-        name: 'Chief Automotive Editor (Admin)',
-        email: 'admin@autoverse.global',
-        role: 'ADMIN',
-        createdAt: '2025-01-01T00:00:00Z',
-        lastLoginAt: new Date().toISOString()
-      },
-      {
-        id: 'usr-demo-1',
-        phoneNumber: '+1 555-0100',
-        countryCode: '+1',
-        name: 'Alex Vance',
-        email: 'alex.vance@autoverse.example',
-        role: 'USER',
-        createdAt: '2025-02-10T12:00:00Z',
-        lastLoginAt: new Date().toISOString()
-      }
-    ];
-  }
-
-  private getDefaultAuditLogs(): AuditLogEntry[] {
-    return [
-      {
-        id: 'log-1',
-        timestamp: new Date(Date.now() - 86400000 * 3).toISOString(),
-        adminUser: 'Chief Automotive Editor',
-        action: 'VERIFY_RECORD',
-        targetEntity: 'Porsche Taycan Turbo S',
-        details: 'Verified against European Community Whole Vehicle Type-Approval (EC-WVTA) certificates.'
-      },
-      {
-        id: 'log-2',
-        timestamp: new Date(Date.now() - 86400000 * 2).toISOString(),
-        adminUser: 'Chief Automotive Editor',
-        action: 'UPDATE_PRICING',
-        targetEntity: 'BMW iX M60 xDrive',
-        details: 'Updated Euro and GCC pricing based on official 2026 manufacturer dealer bulletin.'
-      }
-    ];
-  }
-
-  private saveState(stateToSave?: DatabaseState) {
-    try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      fs.writeFileSync(DB_FILE, JSON.stringify(stateToSave || this.state, null, 2), 'utf-8');
-    } catch (err) {
-      console.error('Failed to persist database to file:', err);
-    }
+    await orm.insert(appMeta).values({ key: SEED_KEY, value: new Date().toISOString() }).onConflictDoNothing();
   }
 
   // --- Vehicles ---
-  public getVehicles(): Vehicle[] {
-    return this.state.vehicles;
+  public async getVehicles(): Promise<Vehicle[]> {
+    const rows = await orm.select({ data: vehicles.data }).from(vehicles).orderBy(asc(vehicles.createdAt));
+    return rows.map((r) => r.data as Vehicle);
   }
 
-  public getVehicleById(idOrSlug: string): Vehicle | undefined {
-    return this.state.vehicles.find(
-      (v) => v.id === idOrSlug || v.slug.toLowerCase() === idOrSlug.toLowerCase()
-    );
+  public async getVehicleById(idOrSlug: string): Promise<Vehicle | undefined> {
+    const [row] = await orm
+      .select({ data: vehicles.data })
+      .from(vehicles)
+      .where(or(eq(vehicles.id, idOrSlug), eq(sql`lower(${vehicles.slug})`, idOrSlug.toLowerCase())))
+      .limit(1);
+    return row?.data as Vehicle | undefined;
   }
 
-  public createVehicle(vehicle: Vehicle, adminName: string): Vehicle {
-    this.state.vehicles.push(vehicle);
-    this.logAudit({
+  public async getVehiclesByIds(ids: string[]): Promise<Vehicle[]> {
+    if (!ids.length) return [];
+    const rows = await orm.select({ data: vehicles.data }).from(vehicles).where(inArray(vehicles.id, ids));
+    return rows.map((r) => r.data as Vehicle);
+  }
+
+  public async createVehicle(vehicle: Vehicle, adminName: string): Promise<Vehicle> {
+    if (!vehicle?.id || !vehicle.slug) {
+      throw new Error('Vehicle id and slug are required.');
+    }
+    await orm.insert(vehicles).values({ id: vehicle.id, slug: vehicle.slug, data: vehicle });
+    await this.logAudit({
       adminUser: adminName,
       action: 'CREATE_VEHICLE',
       targetEntity: `${vehicle.brandName} ${vehicle.name}`,
-      details: `Added new vehicle model with base price ${vehicle.basePrice.formatted}`
+      details: `Added new vehicle model with base price ${vehicle.basePrice?.formatted ?? 'N/A'}`
     });
-    this.saveState();
     return vehicle;
   }
 
-  public updateVehicle(id: string, updates: Partial<Vehicle>, adminName: string): Vehicle | null {
-    const idx = this.state.vehicles.findIndex((v) => v.id === id);
-    if (idx === -1) return null;
-    this.state.vehicles[idx] = { ...this.state.vehicles[idx], ...updates };
-    this.logAudit({
+  public async updateVehicle(id: string, updates: Partial<Vehicle>, adminName: string): Promise<Vehicle | null> {
+    const [row] = await orm.select({ data: vehicles.data }).from(vehicles).where(eq(vehicles.id, id));
+    if (!row) return null;
+    const updated = { ...(row.data as Vehicle), ...updates, id } as Vehicle;
+    await orm.update(vehicles).set({ slug: updated.slug, data: updated }).where(eq(vehicles.id, id));
+    await this.logAudit({
       adminUser: adminName,
       action: 'UPDATE_VEHICLE',
-      targetEntity: this.state.vehicles[idx].name,
+      targetEntity: updated.name,
       details: `Updated specifications and metadata.`
     });
-    this.saveState();
-    return this.state.vehicles[idx];
+    return updated;
   }
 
-  public deleteVehicle(id: string, adminName: string): boolean {
-    const vehicle = this.state.vehicles.find((v) => v.id === id);
-    if (!vehicle) return false;
-    this.state.vehicles = this.state.vehicles.filter((v) => v.id !== id);
-    this.logAudit({
+  public async deleteVehicle(id: string, adminName: string): Promise<boolean> {
+    const [deleted] = await orm.delete(vehicles).where(eq(vehicles.id, id)).returning({ data: vehicles.data });
+    if (!deleted) return false;
+    await this.logAudit({
       adminUser: adminName,
       action: 'DELETE_VEHICLE',
-      targetEntity: vehicle.name,
+      targetEntity: (deleted.data as Vehicle).name,
       details: `Archived vehicle record ID: ${id}`
     });
-    this.saveState();
     return true;
   }
 
   // --- Brands ---
-  public getBrands(): Brand[] {
-    return this.state.brands;
+  public async getBrands(): Promise<Brand[]> {
+    const rows = await orm.select({ data: brands.data }).from(brands).orderBy(asc(brands.createdAt));
+    return rows.map((r) => r.data as Brand);
   }
 
-  public getBrandById(idOrSlug: string): Brand | undefined {
-    return this.state.brands.find(
-      (b) => b.id === idOrSlug || b.slug.toLowerCase() === idOrSlug.toLowerCase()
-    );
+  public async getBrandById(idOrSlug: string): Promise<Brand | undefined> {
+    const [row] = await orm
+      .select({ data: brands.data })
+      .from(brands)
+      .where(or(eq(brands.id, idOrSlug), eq(sql`lower(${brands.slug})`, idOrSlug.toLowerCase())))
+      .limit(1);
+    return row?.data as Brand | undefined;
   }
 
-  public createBrand(brand: Brand, adminName: string): Brand {
-    this.state.brands.push(brand);
-    this.logAudit({
+  public async createBrand(brand: Brand, adminName: string): Promise<Brand> {
+    if (!brand?.id || !brand.slug) {
+      throw new Error('Brand id and slug are required.');
+    }
+    await orm.insert(brands).values({ id: brand.id, slug: brand.slug, data: brand });
+    await this.logAudit({
       adminUser: adminName,
       action: 'CREATE_VEHICLE',
       targetEntity: `Brand: ${brand.name}`,
       details: `Created new brand entry from ${brand.country}`
     });
-    this.saveState();
     return brand;
   }
 
-  // --- Articles ---
+  // --- Articles (static editorial content) ---
   public getArticles(): Article[] {
-    return this.state.articles;
+    return initialArticles;
   }
 
   public getArticleBySlug(slug: string): Article | undefined {
-    return this.state.articles.find((a) => a.slug === slug || a.id === slug);
+    return initialArticles.find((a) => a.slug === slug || a.id === slug);
   }
 
-  // --- Data Sources ---
+  // --- Data Sources (static reference content) ---
   public getDataSources(): DataSourceRecord[] {
-    return this.state.dataSources;
+    return initialDataSources;
   }
 
   // --- Reviews ---
-  public getReviews(vehicleId?: string): Review[] {
-    if (vehicleId) {
-      return this.state.reviews.filter((r) => r.vehicleId === vehicleId);
-    }
-    return this.state.reviews;
+  public async getReviews(vehicleId?: string): Promise<Review[]> {
+    const rows = await orm
+      .select({ data: reviews.data })
+      .from(reviews)
+      .where(vehicleId ? eq(reviews.vehicleId, vehicleId) : undefined)
+      .orderBy(desc(reviews.createdAt));
+    return rows.map((r) => r.data as Review);
   }
 
-  public addReview(review: Review): Review {
-    this.state.reviews.unshift(review);
-    this.saveState();
+  public async addReview(review: Review): Promise<Review> {
+    await orm.insert(reviews).values({ id: review.id, vehicleId: review.vehicleId, data: review });
     return review;
   }
 
   // --- Authentication & OTP ---
-  public requestOtp(phoneNumber: string): { success: boolean; message: string; cooldownSeconds: number; devCode?: string } {
+  public async requestOtp(phoneNumber: string): Promise<{ success: boolean; message: string; cooldownSeconds: number; devCode?: string }> {
     const cleanPhone = phoneNumber.trim();
     const now = Date.now();
-    const existing = this.state.pendingOtps[cleanPhone];
+    const [existing] = await orm.select().from(pendingOtps).where(eq(pendingOtps.phoneNumber, cleanPhone));
 
-    if (existing && now - existing.createdAt < 30000) {
-      const remainingCooldown = Math.ceil((30000 - (now - existing.createdAt)) / 1000);
+    if (existing && now - existing.createdAt.getTime() < 30000) {
+      const remainingCooldown = Math.ceil((30000 - (now - existing.createdAt.getTime())) / 1000);
       return {
         success: false,
         message: `Please wait ${remainingCooldown} seconds before requesting a new code.`,
@@ -307,13 +328,14 @@ class DatabaseService {
       code = Math.floor(100000 + Math.random() * 900000).toString();
     }
 
-    this.state.pendingOtps[cleanPhone] = {
+    const values = {
+      phoneNumber: cleanPhone,
       code,
-      createdAt: now,
-      expiresAt: now + 5 * 60 * 1000, // 5 min expiry
-      attempts: 0
+      attempts: 0,
+      createdAt: new Date(now),
+      expiresAt: new Date(now + 5 * 60 * 1000) // 5 min expiry
     };
-    this.saveState();
+    await orm.insert(pendingOtps).values(values).onConflictDoUpdate({ target: pendingOtps.phoneNumber, set: values });
 
     return {
       success: true,
@@ -323,9 +345,9 @@ class DatabaseService {
     };
   }
 
-  public verifyOtp(phoneNumber: string, code: string, countryCode: string, name?: string): { success: boolean; message: string; token?: string; user?: User } {
+  public async verifyOtp(phoneNumber: string, code: string, countryCode: string, name?: string): Promise<{ success: boolean; message: string; token?: string; user?: User }> {
     const cleanPhone = phoneNumber.trim();
-    const pending = this.state.pendingOtps[cleanPhone];
+    const [pending] = await orm.select().from(pendingOtps).where(eq(pendingOtps.phoneNumber, cleanPhone));
     const now = Date.now();
 
     // Universal sandbox acceptance for documented test phone numbers
@@ -335,190 +357,191 @@ class DatabaseService {
     }
 
     if (pending) {
-      if (now > pending.expiresAt) {
-        delete this.state.pendingOtps[cleanPhone];
-        this.saveState();
+      if (now > pending.expiresAt.getTime()) {
+        await orm.delete(pendingOtps).where(eq(pendingOtps.phoneNumber, cleanPhone));
         return { success: false, message: 'Verification code has expired. Please request a new code.' };
       }
 
       if (pending.code !== code.trim() && !(isSandboxNumber && code.trim() === '123456')) {
-        pending.attempts += 1;
-        if (pending.attempts >= 5) {
-          delete this.state.pendingOtps[cleanPhone];
-          this.saveState();
+        const attempts = pending.attempts + 1;
+        if (attempts >= 5) {
+          await orm.delete(pendingOtps).where(eq(pendingOtps.phoneNumber, cleanPhone));
           return { success: false, message: 'Maximum verification attempts exceeded. Please request a new code.' };
         }
-        this.saveState();
+        await orm.update(pendingOtps).set({ attempts }).where(eq(pendingOtps.phoneNumber, cleanPhone));
         return { success: false, message: 'Invalid verification code. Please check and try again.' };
       }
+    } else if (code.trim() !== '123456') {
+      return { success: false, message: 'Invalid verification code. Please check and try again.' };
     }
 
     // Code matches or sandbox bypass
-    delete this.state.pendingOtps[cleanPhone];
+    await orm.delete(pendingOtps).where(eq(pendingOtps.phoneNumber, cleanPhone));
 
     // Find or create user
-    let user = this.state.users.find((u) => u.phoneNumber === cleanPhone);
     const isAdmin = cleanPhone.includes('555-0199');
+    const [existingUser] = await orm.select().from(users).where(eq(users.phoneNumber, cleanPhone));
+    let userRow: UserRow;
 
-    if (!user) {
-      user = {
-        id: `usr-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-        phoneNumber: cleanPhone,
-        countryCode: countryCode || '+1',
-        name: name || (isAdmin ? 'Chief Automotive Editor' : 'Automotive Enthusiast'),
-        role: isAdmin ? 'ADMIN' : 'USER',
-        createdAt: new Date().toISOString(),
-        lastLoginAt: new Date().toISOString()
-      };
-      this.state.users.push(user);
+    if (!existingUser) {
+      [userRow] = await orm
+        .insert(users)
+        .values({
+          id: randomId('usr'),
+          phoneNumber: cleanPhone,
+          countryCode: countryCode || '+1',
+          name: name || (isAdmin ? 'Chief Automotive Editor' : 'Automotive Enthusiast'),
+          role: isAdmin ? 'ADMIN' : 'USER'
+        })
+        .returning();
     } else {
-      user.lastLoginAt = new Date().toISOString();
-      if (name) user.name = name;
+      [userRow] = await orm
+        .update(users)
+        .set({ lastLoginAt: new Date(), ...(name ? { name } : {}) })
+        .where(eq(users.id, existingUser.id))
+        .returning();
     }
 
     // Create session token
-    const token = `av_${Buffer.from(`${user.id}:${Date.now()}:${Math.random()}`).toString('base64url')}`;
-    this.state.activeSessions[token] = {
-      userId: user.id,
-      createdAt: now,
-      expiresAt: now + 30 * 24 * 3600 * 1000 // 30 days
-    };
+    const token = `av_${Buffer.from(`${userRow.id}:${Date.now()}:${crypto.randomUUID()}`).toString('base64url')}`;
+    await orm.insert(sessions).values({
+      token,
+      userId: userRow.id,
+      expiresAt: new Date(now + 30 * 24 * 3600 * 1000) // 30 days
+    });
 
-    this.saveState();
     return {
       success: true,
       message: 'Phone number verified successfully.',
       token,
-      user
+      user: toUser(userRow)
     };
   }
 
-  public getUserByToken(token: string): User | null {
+  public async getUserByToken(token: string): Promise<User | null> {
     if (!token) return null;
-    const session = this.state.activeSessions[token];
-    if (!session) return null;
-    if (Date.now() > session.expiresAt) {
-      delete this.state.activeSessions[token];
-      this.saveState();
+    const [row] = await orm
+      .select({ user: users, expiresAt: sessions.expiresAt })
+      .from(sessions)
+      .innerJoin(users, eq(sessions.userId, users.id))
+      .where(eq(sessions.token, token));
+    if (!row) return null;
+    if (Date.now() > row.expiresAt.getTime()) {
+      await orm.delete(sessions).where(eq(sessions.token, token));
       return null;
     }
-    return this.state.users.find((u) => u.id === session.userId) || null;
+    return toUser(row.user);
   }
 
-  public logout(token: string): boolean {
-    if (token && this.state.activeSessions[token]) {
-      delete this.state.activeSessions[token];
-      this.saveState();
-      return true;
-    }
-    return false;
+  public async logout(token: string): Promise<boolean> {
+    if (!token) return false;
+    const deleted = await orm.delete(sessions).where(eq(sessions.token, token)).returning({ token: sessions.token });
+    return deleted.length > 0;
   }
 
-  public updateUserProfile(userId: string, updates: Partial<User>): User | null {
-    const user = this.state.users.find((u) => u.id === userId);
-    if (!user) return null;
-    if (updates.name) user.name = updates.name;
-    if (updates.email) user.email = updates.email;
-    this.saveState();
-    return user;
+  public async updateUserProfile(userId: string, updates: Partial<User>): Promise<User | null> {
+    const set: Partial<UserRow> = {};
+    if (updates.name) set.name = updates.name;
+    if (updates.email) set.email = updates.email;
+    const [row] = Object.keys(set).length
+      ? await orm.update(users).set(set).where(eq(users.id, userId)).returning()
+      : await orm.select().from(users).where(eq(users.id, userId));
+    return row ? toUser(row) : null;
   }
 
-  public deleteUserAccount(userId: string): boolean {
-    this.state.users = this.state.users.filter((u) => u.id !== userId);
-    delete this.state.userFavorites[userId];
-    this.state.searchHistory = this.state.searchHistory.filter((sh) => sh.userId !== userId);
-    // remove sessions
-    for (const [token, session] of Object.entries(this.state.activeSessions)) {
-      if (session.userId === userId) {
-        delete this.state.activeSessions[token];
-      }
-    }
-    this.saveState();
+  public async deleteUserAccount(userId: string): Promise<boolean> {
+    // Sessions, favorites and search history cascade with the user row.
+    await orm.delete(users).where(eq(users.id, userId));
     return true;
   }
 
   // --- Favorites & Collections ---
-  public getFavorites(userId: string): Vehicle[] {
-    const favIds = this.state.userFavorites[userId] || [];
-    return this.state.vehicles.filter((v) => favIds.includes(v.id));
+  public async getFavorites(userId: string): Promise<Vehicle[]> {
+    const rows = await orm
+      .select({ data: vehicles.data })
+      .from(favorites)
+      .innerJoin(vehicles, eq(favorites.vehicleId, vehicles.id))
+      .where(eq(favorites.userId, userId))
+      .orderBy(asc(vehicles.createdAt));
+    return rows.map((r) => r.data as Vehicle);
   }
 
-  public toggleFavorite(userId: string, vehicleId: string): { isFavorite: boolean; favorites: string[] } {
-    if (!this.state.userFavorites[userId]) {
-      this.state.userFavorites[userId] = [];
+  public async toggleFavorite(userId: string, vehicleId: string): Promise<{ isFavorite: boolean; favorites: string[] }> {
+    const removed = await orm
+      .delete(favorites)
+      .where(and(eq(favorites.userId, userId), eq(favorites.vehicleId, vehicleId)))
+      .returning({ vehicleId: favorites.vehicleId });
+    const isFavorite = removed.length === 0;
+    if (isFavorite) {
+      await orm.insert(favorites).values({ userId, vehicleId }).onConflictDoNothing();
     }
-    const list = this.state.userFavorites[userId];
-    const idx = list.indexOf(vehicleId);
-    let isFavorite = false;
-    if (idx === -1) {
-      list.push(vehicleId);
-      isFavorite = true;
-    } else {
-      list.splice(idx, 1);
-      isFavorite = false;
-    }
-    this.saveState();
-    return { isFavorite, favorites: list };
+    const list = await orm
+      .select({ vehicleId: favorites.vehicleId })
+      .from(favorites)
+      .where(eq(favorites.userId, userId))
+      .orderBy(asc(favorites.createdAt));
+    return { isFavorite, favorites: list.map((f) => f.vehicleId) };
   }
 
   // --- Search History ---
-  public getSearchHistory(userId?: string): SearchHistoryEntry[] {
-    if (userId) {
-      return this.state.searchHistory.filter((sh) => sh.userId === userId);
-    }
-    return this.state.searchHistory.slice(0, 20);
+  public async getSearchHistory(userId?: string): Promise<SearchHistoryEntry[]> {
+    const rows = userId
+      ? await orm.select().from(searchHistory).where(eq(searchHistory.userId, userId)).orderBy(desc(searchHistory.createdAt))
+      : await orm.select().from(searchHistory).where(isNull(searchHistory.userId)).orderBy(desc(searchHistory.createdAt)).limit(20);
+    return rows.map(toHistory);
   }
 
-  public addSearchHistory(entry: Omit<SearchHistoryEntry, 'id' | 'timestamp'>): SearchHistoryEntry {
-    const item: SearchHistoryEntry = {
-      id: `sh-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      timestamp: new Date().toISOString(),
-      ...entry
-    };
-    this.state.searchHistory.unshift(item);
-    if (this.state.searchHistory.length > 200) {
-      this.state.searchHistory = this.state.searchHistory.slice(0, 200);
+  public async addSearchHistory(entry: Omit<SearchHistoryEntry, 'id' | 'timestamp'>): Promise<SearchHistoryEntry> {
+    const [row] = await orm
+      .insert(searchHistory)
+      .values({
+        id: randomId('sh'),
+        userId: entry.userId ?? null,
+        query: entry.query,
+        filters: entry.filters ?? null
+      })
+      .returning();
+
+    // Keep at most 200 entries per user (or for anonymous visitors combined).
+    const scope = entry.userId ? eq(searchHistory.userId, entry.userId) : isNull(searchHistory.userId);
+    const [cutoff] = await orm
+      .select({ createdAt: searchHistory.createdAt })
+      .from(searchHistory)
+      .where(scope)
+      .orderBy(desc(searchHistory.createdAt))
+      .offset(199)
+      .limit(1);
+    if (cutoff) {
+      await orm.delete(searchHistory).where(and(scope, lt(searchHistory.createdAt, cutoff.createdAt)));
     }
-    this.saveState();
-    return item;
+
+    return toHistory(row);
   }
 
-  public clearSearchHistory(userId?: string): void {
-    if (userId) {
-      this.state.searchHistory = this.state.searchHistory.filter((sh) => sh.userId !== userId);
-    } else {
-      this.state.searchHistory = [];
-    }
-    this.saveState();
+  public async clearSearchHistory(userId?: string): Promise<void> {
+    await orm.delete(searchHistory).where(userId ? eq(searchHistory.userId, userId) : isNull(searchHistory.userId));
   }
 
   // --- Audit Logs ---
-  public getAuditLogs(): AuditLogEntry[] {
-    return this.state.auditLogs;
+  public async getAuditLogs(): Promise<AuditLogEntry[]> {
+    const rows = await orm.select().from(auditLogs).orderBy(desc(auditLogs.createdAt)).limit(300);
+    return rows.map(toAudit);
   }
 
-  public logAudit(log: Omit<AuditLogEntry, 'id' | 'timestamp'>): void {
-    const entry: AuditLogEntry = {
-      id: `log-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      timestamp: new Date().toISOString(),
-      ...log
-    };
-    this.state.auditLogs.unshift(entry);
-    if (this.state.auditLogs.length > 300) {
-      this.state.auditLogs = this.state.auditLogs.slice(0, 300);
-    }
+  public async logAudit(log: Omit<AuditLogEntry, 'id' | 'timestamp'>): Promise<void> {
+    await orm.insert(auditLogs).values({ id: randomId('log'), ...log });
   }
 
   // --- Batch CSV Vehicle Import ---
-  public importVehiclesFromCsv(csvText: string, adminName: string): { importedCount: number; errors: string[] } {
+  public async importVehiclesFromCsv(csvText: string, adminName: string): Promise<{ importedCount: number; errors: string[] }> {
     const lines = csvText.trim().split('\n');
     if (lines.length < 2) {
       return { importedCount: 0, errors: ['CSV file must have header and at least 1 record.'] };
     }
 
     const headers = lines[0].split(',').map((h) => h.trim().toLowerCase());
-    let imported = 0;
     const errors: string[] = [];
+    const imported: Vehicle[] = [];
 
     for (let i = 1; i < lines.length; i++) {
       const line = lines[i].trim();
@@ -639,36 +662,44 @@ class DatabaseService {
           }
         };
 
-        this.state.vehicles.push(newVehicle);
-        imported++;
+        imported.push(newVehicle);
       } catch (err: any) {
         errors.push(`Row ${i + 1}: ${err.message || 'Invalid format'}`);
       }
     }
 
-    this.logAudit({
+    if (imported.length) {
+      await orm.insert(vehicles).values(imported.map((v) => ({ id: v.id, slug: v.slug, data: v })));
+    }
+
+    await this.logAudit({
       adminUser: adminName,
       action: 'IMPORT_CSV',
-      targetEntity: `Batch Import (${imported} vehicles)`,
-      details: `Imported ${imported} records with ${errors.length} errors.`
+      targetEntity: `Batch Import (${imported.length} vehicles)`,
+      details: `Imported ${imported.length} records with ${errors.length} errors.`
     });
-    this.saveState();
 
-    return { importedCount: imported, errors };
+    return { importedCount: imported.length, errors };
   }
 
   // --- Metrics ---
-  public getDatabaseMetrics() {
+  public async getDatabaseMetrics() {
+    const [allVehicles, [brandCount], [userCount], [reviewCount]] = await Promise.all([
+      this.getVehicles(),
+      orm.select({ n: sql<number>`count(*)::int` }).from(brands),
+      orm.select({ n: sql<number>`count(*)::int` }).from(users),
+      orm.select({ n: sql<number>`count(*)::int` }).from(reviews)
+    ]);
     return {
-      totalVehicles: this.state.vehicles.length,
-      totalBrands: this.state.brands.length,
-      totalArticles: this.state.articles.length,
-      totalUsers: this.state.users.length,
-      totalDataSources: this.state.dataSources.length,
-      totalReviews: this.state.reviews.length,
-      verifiedRecordsCount: this.state.vehicles.filter((v) => v.verifiedDataSource).length,
-      electricVehiclesCount: this.state.vehicles.filter((v) => v.powertrainType === 'Battery Electric').length,
-      hybridVehiclesCount: this.state.vehicles.filter((v) => v.powertrainType.includes('Hybrid')).length
+      totalVehicles: allVehicles.length,
+      totalBrands: brandCount.n,
+      totalArticles: initialArticles.length,
+      totalUsers: userCount.n,
+      totalDataSources: initialDataSources.length,
+      totalReviews: reviewCount.n,
+      verifiedRecordsCount: allVehicles.filter((v) => v.verifiedDataSource).length,
+      electricVehiclesCount: allVehicles.filter((v) => v.powertrainType === 'Battery Electric').length,
+      hybridVehiclesCount: allVehicles.filter((v) => v.powertrainType?.includes('Hybrid')).length
     };
   }
 }
