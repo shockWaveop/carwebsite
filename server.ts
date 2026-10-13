@@ -28,7 +28,7 @@ function authenticateUser(req: Request): any | null {
 // Admin guard middleware
 function requireAdmin(req: Request, res: Response, next: NextFunction) {
   const adminKey = req.headers['x-admin-key'] as string;
-  if (adminKey && adminKey === (process.env.ADMIN_ACCESS_KEY || 'autoverse-admin-2026')) {
+  if (adminKey && process.env.ADMIN_ACCESS_KEY && adminKey === process.env.ADMIN_ACCESS_KEY) {
     (req as any).adminUser = 'System Superadmin';
     return next();
   }
